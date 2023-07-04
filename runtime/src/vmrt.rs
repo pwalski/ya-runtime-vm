@@ -17,10 +17,10 @@ use ya_runtime_sdk::{serialize, ErrorExt, EventEmitter};
 use crate::deploy::Deployment;
 use crate::guest_agent_comm::{GuestAgent, Notification};
 
-const DIR_RUNTIME: &str = "runtime";
-const FILE_RUNTIME: &str = "vmrt";
-const FILE_VMLINUZ: &str = "vmlinuz-virt";
-const FILE_INITRAMFS: &str = "initramfs.cpio.gz";
+pub const DIR_RUNTIME: &str = "runtime";
+pub const FILE_RUNTIME: &str = "vmrt";
+pub const FILE_VMLINUZ: &str = "vmlinuz-virt";
+pub const FILE_INITRAMFS: &str = "initramfs.cpio.gz";
 
 #[derive(Default)]
 pub struct RuntimeData {
@@ -182,16 +182,16 @@ pub async fn start_vmrt(
 }
 
 #[derive(Copy, Clone, Debug)]
-struct SocketConf {
+pub struct SocketConf {
     ip: Ipv4Addr,
     udp: u16,
     tcp: u16,
 }
 
 #[derive(Debug)]
-struct SocketPairConf {
-    first: SocketConf,
-    second: SocketConf,
+pub struct SocketPairConf {
+    pub first: SocketConf,
+    pub second: SocketConf,
 }
 
 impl Default for SocketPairConf {
@@ -206,7 +206,7 @@ impl Default for SocketPairConf {
 
 impl SocketPairConf {
     // FIXME: TOC/TOU
-    async fn probe(&mut self) -> anyhow::Result<()> {
+    pub async fn probe(&mut self) -> anyhow::Result<()> {
         let first = std::net::UdpSocket::bind((self.first.ip, self.first.udp))?;
         let second = std::net::UdpSocket::bind((self.second.ip, self.second.udp))?;
 
@@ -223,7 +223,7 @@ impl SocketPairConf {
     }
 }
 
-fn configure_chardev_endpoint(
+pub fn configure_chardev_endpoint(
     cmd: &mut process::Command,
     id: &str,
     temp_dir: impl AsRef<Path>,
@@ -243,7 +243,7 @@ fn configure_chardev_endpoint(
     Ok(ContainerEndpoint::UnixStream(sock))
 }
 
-fn configure_netdev_endpoint(
+pub fn configure_netdev_endpoint(
     cmd: &mut process::Command,
     id: &str,
     endpoint: &Option<ContainerEndpoint>,
@@ -325,7 +325,7 @@ pub fn runtime_dir() -> io::Result<PathBuf> {
         .join(DIR_RUNTIME))
 }
 
-async fn reader_to_log<T: io::AsyncRead + Unpin>(reader: T) {
+pub async fn reader_to_log<T: io::AsyncRead + Unpin>(reader: T) {
     let mut reader = io::BufReader::new(reader);
     let mut buf = Vec::new();
     loop {
@@ -341,7 +341,7 @@ async fn reader_to_log<T: io::AsyncRead + Unpin>(reader: T) {
     }
 }
 
-async fn notification_into_status(
+pub async fn notification_into_status(
     notification: Notification,
     ga: Arc<Mutex<GuestAgent>>,
 ) -> server::ProcessStatus {
