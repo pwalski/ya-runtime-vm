@@ -77,11 +77,6 @@ pub(crate) async fn run_self_test<HANDLER>(
     let deployment = self_test_deployment(&work_dir, cpu_cores, mem_gib)
         .await
         .expect("Prepares self test img deployment");
-
-    // let ga = GuestAgent::connected(temp_path.join("manager.sock"), 10, move |n, _g| {
-    //     let notifications = ns.clone();
-    //     async move { notifications.clone().handle(n) }.boxed()
-    // });
     
     let runtime_data = RuntimeData {
         deployment: Some(deployment),
@@ -96,11 +91,6 @@ pub(crate) async fn run_self_test<HANDLER>(
         let ctx = Context::try_new().expect("Creates runtime context");
 
         log::info!("Starting runtime");
-        // let (status_sender, mut status_receiver) = mpsc::channel();
-        // let emitter = EventEmitter::spawn(ProcessOutputHandler {
-        //     handler: Box::new(e),
-        //     status_sender,
-        // });
         
         let notifications = Arc::new(Notifications::new());
 
@@ -202,7 +192,7 @@ pub(crate) async fn run_self_test<HANDLER>(
 
             let mut runtime = cmd
                 .stdin(Stdio::null())
-                // .stdout(Stdio::piped()) // why not?
+                .stdout(Stdio::piped()) // why not?
                 .kill_on_drop(true)
                 .spawn()?;
 
@@ -216,25 +206,11 @@ pub(crate) async fn run_self_test<HANDLER>(
             })
             .await?;
 
-            // {
-            //     let mut ga = ga.lock().await;
-            //     for (idx, volume) in deployment.volumes.iter().enumerate() {
-            //         ga.mount(format!("mnt{}", idx).as_str(), volume.path.as_str())
-            //             .await?
-            //             .expect("Mount failed");
-            //     }
-            // }
-
             data.runtime.replace(runtime);
             data.ga.replace(ga);
 
             Ok(())
         }.await;
-
-        // let start_response = crate::start(work_dir.clone(), runtime.data.clone(), emitter.clone())
-        //     .await
-        //     .expect("Starts runtime");
-        // log::info!("Runtime start response {:?}", start_response);
 
         let run_process: ya_runtime_sdk::RunProcess = server::RunProcess {
             bin: "/ya-self-test".into(),
@@ -245,12 +221,6 @@ pub(crate) async fn run_self_test<HANDLER>(
 
         log::info!("Runtime: {:?}", runtime.data);
         log::info!("Self test process: {run_process:?}");
-
-        // //
-        // let pid: u64 = crate::run_command(runtime.data.clone(), run_process)
-        //     .await
-        //     .expect("Runs command");
-        // //
         
         let ga = runtime.data.lock().await.ga().unwrap();
         let r_data = runtime.data.clone();
@@ -301,16 +271,36 @@ pub(crate) async fn run_self_test<HANDLER>(
                 .expect("Run process failed")
         };
         
-        notifications.process_died.notified().await;
+        tokio::select! {
+            _ = notifications.process_died.notified() => (),
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => ()
+        } 
 
-        let mut ga = ga.lock().await;
-        let out = ga
-            .query_output(pid, 1, 0, u64::MAX)
-            .await.unwrap()
-            .expect("Output query failed");
-        let out = String::from_utf8(out).unwrap();
-        println!("Stdout: {out}");
-        let status = Ok(Value::from_str(&out).unwrap());
+        let out_str = async {
+            let mut ga = ga.lock().await;
+
+            let mut out = ga
+                .query_output(pid, 1, 0, u64::MAX)
+                .await.unwrap()
+                .unwrap_or(vec![]);
+
+            let out_str = String::from_utf8(out.clone()).unwrap_or("".into());
+            println!("Stdout: {out_str}");
+
+            let mut err = ga
+                .query_output(pid, 2, 0, u64::MAX)
+                .await.unwrap()
+                .unwrap_or(vec![]);
+            let err_str = String::from_utf8(err.clone()).unwrap_or("".into());
+            println!("Stderr: {err_str}");
+            out_str
+        }.await;
+
+        let status = Ok(Value::from_str(&out_str)
+            .unwrap_or(Value::from_str(&format!("{{ 
+                \"stdout\": \"{out_str}\" 
+            }}"))
+            .unwrap()));
 
         log::info!("Process finished");
         let result = handle_result(status).expect("Handles test result");
