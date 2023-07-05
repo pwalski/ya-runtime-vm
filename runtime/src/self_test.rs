@@ -165,7 +165,7 @@ async fn run_command(
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let output_notification = Arc::new(Notify::new());
-    let _watcher = spawn_output_watcher(output_notification.clone(), &output_dir)?;
+    let _watcher = spawn_output_watcher(output_notification.clone(), output_dir)?;
 
     if let Err(err) = crate::run_command(runtime_data, run_process).await {
         bail!("Code: {}, msg: {}", err.code, err.message);
@@ -195,6 +195,6 @@ fn spawn_output_watcher(
         }
     })?;
 
-    watcher.watch(&output_dir, RecursiveMode::Recursive)?;
+    watcher.watch(output_dir, RecursiveMode::Recursive)?;
     Ok(watcher)
 }
