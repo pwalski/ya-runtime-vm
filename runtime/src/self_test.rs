@@ -53,22 +53,15 @@ pub(crate) async fn run_self_test<HANDLER>(
         .expect("Prepares self test img deployment");
 
     let output_volume =
-        self_test_only_volume(&deployment).expect("Self test image has an output volume");
+        get_self_test_only_volume(&deployment).expect("Self test image has an output volume");
     let output_file_name = format!("out_{}.json", Uuid::new_v4());
     let output_file_vm = PathBuf::from_str(&output_volume.path)
         .expect("Can create self test volume path")
         .join(&output_file_name);
     let output_dir = work_dir.join(output_volume.name);
-    let output_file = output_dir.join(output_file_name);
+    let output_file = output_dir.join(&output_file_name);
 
-    let runtime_data = RuntimeData {
-        deployment: Some(deployment),
-        pci_device_id,
-        ..Default::default()
-    };
-    let runtime = Runtime {
-        data: Arc::new(Mutex::new(runtime_data)),
-    };
+    let runtime = self_test_runtime(deployment, pci_device_id);
 
     server::run_async(|e| async {
         let ctx = Context::try_new().expect("Creates runtime context");
@@ -91,9 +84,15 @@ pub(crate) async fn run_self_test<HANDLER>(
 
         log::info!("Runtime: {:?}", runtime.data);
         log::info!("Self test process: {run_process:?}");
-        run_command(runtime.data.clone(), run_process, &output_dir, timeout)
-            .await
-            .expect("Can run self-test command");
+        run_command(
+            runtime.data.clone(),
+            run_process,
+            &output_dir,
+            &output_file,
+            timeout,
+        )
+        .await
+        .expect("Can run self-test command");
 
         log::info!("Stopping runtime");
         crate::stop(runtime.data.clone())
@@ -101,11 +100,11 @@ pub(crate) async fn run_self_test<HANDLER>(
             .expect("Stops runtime");
 
         log::info!("Handling result");
-        let out_file = std::fs::File::open(output_file).expect("Output file should exist");
-        let out: anyhow::Result<Value> =
-            Ok(serde_json::from_reader(&out_file).expect("Output file should be a JSON"));
-        let result = handle_result(out).expect("Handles test result");
+        let out_result = read_json(&output_file);
+        std::fs::remove_dir_all(output_dir).expect("Removes self-test output dir");
+        let result = handle_result(out_result).expect("Handles test result");
         if !result.is_empty() {
+            // the server refuses to stop by itself; print output to stdout
             println!("{result}");
         }
 
@@ -119,6 +118,18 @@ pub(crate) async fn run_self_test<HANDLER>(
     .await;
 }
 
+fn self_test_runtime(deployment: Deployment, pci_device_id: Option<String>) -> Runtime {
+    let runtime_data = RuntimeData {
+        deployment: Some(deployment),
+        pci_device_id,
+        ..Default::default()
+    };
+    Runtime {
+        data: Arc::new(Mutex::new(runtime_data)),
+    }
+}
+
+/// Builds self test deployment based on `FILE_TEST_IMAGE` from path returned by `runtime_dir()`
 async fn self_test_deployment(
     work_dir: &Path,
     cpu_cores: usize,
@@ -150,29 +161,33 @@ async fn self_test_deployment(
 }
 
 /// Returns path to self test image only volume.
-/// Fails if no volumes or more than one.
-fn self_test_only_volume(self_test_deployment: &Deployment) -> anyhow::Result<ContainerVolume> {
+/// Fails if `self_test_deployment` has no volumes or more than one.
+fn get_self_test_only_volume(self_test_deployment: &Deployment) -> anyhow::Result<ContainerVolume> {
     if self_test_deployment.volumes.len() != 1 {
         bail!("Self test image has to have one volume");
     }
     Ok(self_test_deployment.volumes.first().unwrap().clone())
 }
 
+/// Runs command, monitors `output_dir` looking for `output_file`.
+/// Fails if `output_file` not created before `timeout`.
 async fn run_command(
     runtime_data: Arc<Mutex<RuntimeData>>,
     run_process: RunProcess,
     output_dir: &Path,
+    output_file: &Path,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let output_notification = Arc::new(Notify::new());
-    let _watcher = spawn_output_watcher(output_notification.clone(), output_dir)?;
+    // Keep `_watcher` . Watcher shutdowns when dropped.
+    let _watcher = spawn_output_watcher(output_notification.clone(), output_dir, output_file)?;
 
     if let Err(err) = crate::run_command(runtime_data, run_process).await {
         bail!("Code: {}, msg: {}", err.code, err.message);
     };
 
     if let Err(err) = tokio::time::timeout(timeout, output_notification.notified()).await {
-        log::error!("Self test job timeout: {err}");
+        log::error!("File {output_file:?} not created before timeout of {timeout:?}s. Err: {err}.");
     };
     Ok(())
 }
@@ -180,21 +195,28 @@ async fn run_command(
 fn spawn_output_watcher(
     output_notification: Arc<Notify>,
     output_dir: &Path,
+    output_file: &Path,
 ) -> anyhow::Result<INotifyWatcher> {
+    let output_file = output_file.into();
     let mut watcher = notify::recommended_watcher(move |res| match res {
         Ok(Event {
             kind: EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            paths,
             ..
-        }) => output_notification.notify_waiters(),
+        }) if paths.contains(&output_file) => output_notification.notify_waiters(),
         Ok(event) => {
             log::debug!("Output file watch event: {:?}", event);
         }
         Err(error) => {
             log::error!("Output file watch error: {:?}", error);
-            output_notification.notify_waiters();
         }
     })?;
 
     watcher.watch(output_dir, RecursiveMode::Recursive)?;
     Ok(watcher)
+}
+
+fn read_json(output_file: &Path) -> anyhow::Result<Value> {
+    let output_file = std::fs::File::open(output_file)?;
+    Ok(serde_json::from_reader(&output_file)?)
 }
