@@ -1,19 +1,18 @@
 use anyhow::bail;
 use futures::lock::Mutex;
-use notify::event::{CreateKind, ModifyKind, DataChange};
-use notify::{Event, EventKind, RecursiveMode, Watcher};
+use notify::event::{DataChange, ModifyKind};
+use notify::{Event, EventKind, INotifyWatcher, RecursiveMode, Watcher};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 use tokio::sync::Notify;
 use uuid::Uuid;
 use ya_runtime_sdk::runtime_api::deploy::ContainerVolume;
-use ya_runtime_sdk::runtime_api::server::RuntimeHandler;
-use ya_runtime_sdk::{runtime_api::server, server::Server, Context, ErrorExt, EventEmitter};
-use ya_runtime_sdk::{Error, ProcessStatus, RuntimeStatus};
+use ya_runtime_sdk::RunProcess;
+use ya_runtime_sdk::{runtime_api::server, server::Server, Context, Error, ErrorExt, EventEmitter};
 
 use crate::deploy::Deployment;
 use crate::vmrt::{runtime_dir, RuntimeData};
@@ -53,14 +52,14 @@ pub(crate) async fn run_self_test<HANDLER>(
         .await
         .expect("Prepares self test img deployment");
 
-    let out_volume =
+    let output_volume =
         self_test_only_volume(&deployment).expect("Self test image has an output volume");
-    let out_file_name = format!("out_{}.json", Uuid::new_v4());
-    let out_file_path_vm = PathBuf::from_str(&out_volume.path)
+    let output_file_name = format!("out_{}.json", Uuid::new_v4());
+    let output_file_vm = PathBuf::from_str(&output_volume.path)
         .expect("Can create self test volume path")
-        .join(&out_file_name);
-    let out_dir_path_host = work_dir.join(out_volume.name);
-    let out_file_path_host = out_dir_path_host.join(out_file_name);
+        .join(&output_file_name);
+    let output_dir = work_dir.join(output_volume.name);
+    let output_file = output_dir.join(output_file_name);
 
     let runtime_data = RuntimeData {
         deployment: Some(deployment),
@@ -81,58 +80,30 @@ pub(crate) async fn run_self_test<HANDLER>(
             .expect("Starts runtime");
         log::info!("Runtime start response {:?}", start_response);
 
-        let run_process: ya_runtime_sdk::RunProcess = server::RunProcess {
+        let run_process: RunProcess = server::RunProcess {
             bin: format!("/{FILE_TEST_EXECUTABLE}"),
             args: vec![
                 FILE_TEST_EXECUTABLE.into(),
-                out_file_path_vm.to_string_lossy().into(),
+                output_file_vm.to_string_lossy().into(),
             ],
-            work_dir: "/".into(),
             ..Default::default()
         };
 
         log::info!("Runtime: {:?}", runtime.data);
         log::info!("Self test process: {run_process:?}");
-
-        let _: u64 = crate::run_command(runtime.data.clone(), run_process)
+        run_command(runtime.data.clone(), run_process, &output_dir, timeout)
             .await
-            .expect("Runs command");
-
-        let output_notification = Arc::new(Notify::new());
-        let output_notification_clone = output_notification.clone();
-        let mut watcher = notify::recommended_watcher(move |res| match res {
-            Ok(Event {
-                kind: EventKind::Modify(ModifyKind::Data(DataChange::Any)),
-                ..
-            }) => output_notification_clone.notify_waiters(),
-            Ok(event) => {
-                log::debug!("Output file watch event: {:?}", event);
-            },
-            Err(error) => {
-                log::error!("Output file watch error: {:?}", error);
-                output_notification_clone.notify_waiters();
-            }
-        })
-        .expect("Can create file watcher");
-
-        watcher
-            .watch(&out_dir_path_host, RecursiveMode::Recursive)
-            .expect("Can watch self-test output file");
-
-        if let Err(err) = tokio::time::timeout(timeout, output_notification.notified()).await {
-            log::error!("Self test job timeout: {err}");
-        };
+            .expect("Can run self-test command");
 
         log::info!("Stopping runtime");
         crate::stop(runtime.data.clone())
             .await
             .expect("Stops runtime");
-        
+
         log::info!("Handling result");
-        let out_file = std::fs::File::open(out_file_path_host)
-            .expect("File should open read only");
-        let out: anyhow::Result<Value> = Ok(serde_json::from_reader(&out_file)
-            .expect("File should be a JSON"));
+        let out_file = std::fs::File::open(output_file).expect("Output file should exist");
+        let out: anyhow::Result<Value> =
+            Ok(serde_json::from_reader(&out_file).expect("Output file should be a JSON"));
         let result = handle_result(out).expect("Handles test result");
         if !result.is_empty() {
             println!("{result}");
@@ -146,15 +117,6 @@ pub(crate) async fn run_self_test<HANDLER>(
         Server::new(runtime, ctx)
     })
     .await;
-}
-
-/// Returns path to self test image only volume.
-/// Fails if no volumes or more than one.
-fn self_test_only_volume(self_test_deployment: &Deployment) -> anyhow::Result<ContainerVolume> {
-    if self_test_deployment.volumes.len() != 1 {
-        bail!("Self test image has to have one volume");
-    }
-    Ok(self_test_deployment.volumes.first().unwrap().clone())
 }
 
 async fn self_test_deployment(
@@ -187,67 +149,52 @@ async fn self_test_deployment(
     Ok(deployment)
 }
 
-struct ProcessOutputHandler {
-    status_sender: mpsc::Sender<ProcessStatus>,
-    handler: Box<dyn RuntimeHandler + 'static>,
+/// Returns path to self test image only volume.
+/// Fails if no volumes or more than one.
+fn self_test_only_volume(self_test_deployment: &Deployment) -> anyhow::Result<ContainerVolume> {
+    if self_test_deployment.volumes.len() != 1 {
+        bail!("Self test image has to have one volume");
+    }
+    Ok(self_test_deployment.volumes.first().unwrap().clone())
 }
 
-impl RuntimeHandler for ProcessOutputHandler {
-    fn on_process_status<'a>(&self, status: ProcessStatus) -> futures::future::BoxFuture<'a, ()> {
-        if let Err(err) = self.status_sender.send(status.clone()) {
-            log::warn!("Failed to send process status {err}");
-        }
-        self.handler.on_process_status(status)
-    }
-
-    fn on_runtime_status<'a>(&self, status: RuntimeStatus) -> futures::future::BoxFuture<'a, ()> {
-        self.handler.on_runtime_status(status)
-    }
-}
-
-/// Collects process `stdout` and tries to parse it into `serde_json::Value`.
-///  # Arguments
-/// * `status_receiver` of `ProcessStatus`
-/// * `pid`
-/// * `timeout` used to wait for `ProcessStatus`
-async fn collect_process_response(
-    status_receiver: &mut mpsc::Receiver<ProcessStatus>,
-    pid: u64,
+async fn run_command(
+    runtime_data: Arc<Mutex<RuntimeData>>,
+    run_process: RunProcess,
+    output_dir: &Path,
     timeout: Duration,
-) -> anyhow::Result<Value> {
-    log::debug!("Start listening on process: {pid}");
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let mut return_code = 0;
-    while let Ok(status) = status_receiver.recv_timeout(timeout) {
-        if status.pid != pid {
-            continue;
+) -> anyhow::Result<()> {
+    let output_notification = Arc::new(Notify::new());
+    let _watcher = spawn_output_watcher(output_notification.clone(), &output_dir)?;
+
+    if let Err(err) = crate::run_command(runtime_data, run_process).await {
+        bail!("Code: {}, msg: {}", err.code, err.message);
+    };
+
+    if let Err(err) = tokio::time::timeout(timeout, output_notification.notified()).await {
+        log::error!("Self test job timeout: {err}");
+    };
+    Ok(())
+}
+
+fn spawn_output_watcher(
+    output_notification: Arc<Notify>,
+    output_dir: &Path,
+) -> anyhow::Result<INotifyWatcher> {
+    let mut watcher = notify::recommended_watcher(move |res| match res {
+        Ok(Event {
+            kind: EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            ..
+        }) => output_notification.notify_waiters(),
+        Ok(event) => {
+            log::debug!("Output file watch event: {:?}", event);
         }
-        stdout.append(&mut status.stdout.clone());
-        stderr.append(&mut status.stderr.clone());
-        return_code = status.return_code;
-        if !status.running {
-            // Process stopped
-            break;
-        } else if status.return_code != 0 {
-            // Process failed. Waiting for final message or timeout.
-            continue;
-        } else if let Ok(response) = serde_json::from_slice(&stdout) {
-            // Succeed parsing response.
-            return Ok(response);
+        Err(error) => {
+            log::error!("Output file watch error: {:?}", error);
+            output_notification.notify_waiters();
         }
-    }
-    if return_code != 0 {
-        bail!(String::from_utf8_lossy(&stderr).to_string())
-    }
-    match serde_json::from_slice(&stdout) {
-        Ok(response) => Ok(response),
-        Err(err) => {
-            if !stderr.is_empty() {
-                bail!(String::from_utf8_lossy(&stderr).to_string())
-            } else {
-                bail!(err)
-            }
-        }
-    }
+    })?;
+
+    watcher.watch(&output_dir, RecursiveMode::Recursive)?;
+    Ok(watcher)
 }
