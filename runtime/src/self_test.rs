@@ -1,7 +1,7 @@
 use anyhow::bail;
 use futures::lock::Mutex;
 use notify::event::{DataChange, ModifyKind};
-use notify::{Event, EventKind, RecursiveMode, Watcher, RecommendedWatcher};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
