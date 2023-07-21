@@ -93,6 +93,13 @@ jobs:
           command: tree
           args: --locked
 
+      - name: 'Login to GitHub Container Registry'
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{github.actor}}
+          password: ${{secrets.GITHUB_TOKEN}}
+
       - name: Build Docker image
         uses: docker/build-push-action@v4
         with:
@@ -213,6 +220,7 @@ jobs:
     needs:
       - create-release
       - build-init
+      - build-self-test-img
     runs-on: ubuntu-latest
     steps:
       - name: Get upload url
@@ -240,15 +248,10 @@ jobs:
           path: runtime/init-container/
       - run: |
           test -f runtime/init-container/initramfs.cpio.gz
-      - name: Download self-test image
-        uses: robinraju/release-downloader@v1.8
+      - uses: actions/download-artifact@v2
         with:
-          repository: ${{ env.self-test-img_repository }}
-          tag: ${{ env.self-test-img_tag }}
-          fileName: self-test.gvmi
-          out-file-path: runtime/image/
-          tarBall: false
-          zipBall: false
+          name: self_test_img
+          path: runtime/image/
       - name: Extract Version
         id: version
         shell: bash
